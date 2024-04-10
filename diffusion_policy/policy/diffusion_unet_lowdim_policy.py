@@ -50,6 +50,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         self.pred_action_steps_only = pred_action_steps_only
         self.oa_step_convention = oa_step_convention
         self.kwargs = kwargs
+        self.max_vals = None 
+        self.min_vals = None 
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -102,9 +104,13 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         result: must include "action" key
         """
 
-        assert 'obs' in obs_dict
-        assert 'past_action' not in obs_dict # not implemented yet
-        nobs = self.normalizer['obs'].normalize(obs_dict['obs'])
+        # assert 'obs' in obs_dict
+        # assert 'past_action' not in obs_dict # not implemented yet
+        # nobs = self.normalizer['obs'].normalize(obs_dict['obs'])
+
+
+        nobs = obs_dict['obs']
+
         B, _, Do = nobs.shape
         To = self.n_obs_steps
         assert Do == self.obs_dim
@@ -152,7 +158,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
-        action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        # action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        action_pred = naction_pred
 
         # get action
         if self.pred_action_steps_only:
@@ -170,7 +177,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         }
         if not (self.obs_as_local_cond or self.obs_as_global_cond):
             nobs_pred = nsample[...,Da:]
-            obs_pred = self.normalizer['obs'].unnormalize(nobs_pred)
+            # obs_pred = self.normalizer['obs'].unnormalize(nobs_pred)
+            obs_pred = nobs_pred
             action_obs_pred = obs_pred[:,start:end]
             result['action_obs_pred'] = action_obs_pred
             result['obs_pred'] = obs_pred
@@ -182,10 +190,12 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
 
     def compute_loss(self, batch):
         # normalize input
-        assert 'valid_mask' not in batch
-        nbatch = self.normalizer.normalize(batch)
-        obs = nbatch['obs']
-        action = nbatch['action']
+        # assert 'valid_mask' not in batch
+        # nbatch = self.normalizer.normalize(batch)
+        # obs = nbatch['obs']
+        # action = nbatch['action']
+        obs = batch['obs']
+        action = batch['action']
 
         # handle different ways of passing observation
         local_cond = None
@@ -234,6 +244,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
+
         pred = self.model(noisy_trajectory, timesteps, 
             local_cond=local_cond, global_cond=global_cond)
 
