@@ -1,3 +1,12 @@
+
+
+# Quim's Fork
+
+Small changes to get this to work with diffusion-nlp project.
+
+
+# Readme of original project
+
 # Diffusion Policy
 
 [[Project page]](https://diffusion-policy.cs.columbia.edu/)
