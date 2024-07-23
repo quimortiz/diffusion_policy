@@ -19,6 +19,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             action_dim, 
             n_action_steps, 
             n_obs_steps,
+            cond_mode = 'none', # 'none', 'local', 'global
             num_inference_steps=None,
             obs_as_local_cond=False,
             obs_as_global_cond=False,
@@ -27,6 +28,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # parameters passed to step
             **kwargs):
         super().__init__()
+        self.cond_mode = cond_mode
         assert not (obs_as_local_cond and obs_as_global_cond)
         if pred_action_steps_only:
             assert obs_as_global_cond
@@ -187,6 +189,11 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
+
+    def loss(self,x,y):
+        batch = {"obs" : y , "action": x}
+        return self.compute_loss(batch)
+        
 
     def compute_loss(self, batch):
         # normalize input
