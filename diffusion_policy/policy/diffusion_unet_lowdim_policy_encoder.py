@@ -11,6 +11,41 @@ from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 import einops
 
+def extract(a, t, x_shape):
+        b, *_ = t.shape
+        out = a.gather(-1, t)
+        return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+class VAEEncoder(nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+        self.sample_noise = False
+
+    def __call__(self, x):
+        mu, logvar, z = self.vae.encode(x)
+        if self.sample_noise:
+            return z
+        else:
+            return mu
+
+    def encode(self, x):
+        return self.__call__(x)
+
+
+class VAEDecoder(nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+
+    def __call__(self, z):
+        return self.vae.decode(z)
+
+    def decode(self, z):
+        return self.__call__(z)
+
+
+
 class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
     def __init__(self, 
             model: ConditionalUnet1D,
@@ -20,19 +55,28 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
             action_dim, 
             n_action_steps, 
             n_obs_steps,
+            name = 'DiffusionUnetLowdimPolicyEncoder_v0',
+            class_name = 'DiffusionUnetLowdimPolicyEncoder',
+            cond_mode = 'none', # 'none', 'local', 'global
             num_inference_steps=None,
             obs_as_local_cond=False,
             obs_as_global_cond=False,
             pred_action_steps_only=False,
             oa_step_convention=False,
-            encoder = None,
-            decoder = None,
+            vision_model = None,
+            z_diff = 1e-5 , 
+            image_diff = 1.,
             # parameters passed to step
             **kwargs):
         super().__init__()
-
-        self.encoder = encoder
-        self.decoder = decoder
+        self.name= name
+        self.class_name = class_name
+        self.cond_mode = cond_mode
+        self.vision_model = vision_model
+        self.encoder = VAEEncoder(vision_model)
+        self.decoder = VAEDecoder(vision_model)
+        self.z_diff = z_diff
+        self.image_diff = image_diff
 
         assert not (obs_as_local_cond and obs_as_global_cond)
         if pred_action_steps_only:
@@ -59,6 +103,10 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
         self.kwargs = kwargs
         self.max_vals = None 
         self.min_vals = None 
+
+        self.sqrt_recip_alphas_cumprod =  torch.sqrt(1. / self.noise_scheduler.alphas_cumprod).cuda()
+        self.sqrt_recipm1_alphas_cumprod =  torch.sqrt(1. / self.noise_scheduler.alphas_cumprod - 1).cuda()
+
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -120,10 +168,15 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
 
 
         _nobs = obs_dict['obs']
+        nobs = self.encoder.encode(_nobs)
+        n_seq = self.n_action_steps
 
-        nobs = einops.rearrange(_nobs, "b t c h w -> (b t) c h w")
-        nobs = self.encoder.encode(nobs)
-        nobs = einops.rearrange(nobs, "(b t) z -> b t z", b=_nobs.shape[0])
+        if self.obs_as_global_cond:
+            nobs = einops.rearrange(nobs, "b z -> b 1 z")
+        else:
+            nobs = einops.repeat(nobs, "b z -> b t z", t=n_seq )
+
+      
 
         B, _, Do = nobs.shape
         To = self.n_obs_steps
@@ -209,13 +262,27 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
         action = self.decoder.decode(action)
         action = einops.rearrange(action, "(b t) ... -> b t ...", b=B)
         # action = einops.rearrange(action, "b c t -> b (c t)")
-        result['action'] = action # is this necessary?
+        result['action_pred'] = action # is this necessary?
 
         return result
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
+
+
+
+    def predict_start_from_noise( self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def loss(self,x,y):
+        batch = {"obs" : y , "action": x}
+        return self.compute_loss(batch)
+        
+        
 
     def compute_loss(self, batch):
         # normalize input
@@ -225,16 +292,23 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
         # action = nbatch['action']
         # I have to encode the observation 
         _obs = batch['obs']
-        
-        obs = einops.rearrange(_obs, "b t c h w -> (b t) c h w")
-        obs = self.encoder.encode(obs)
-        obs = einops.rearrange(obs, "(b t) z -> b t z", b=_obs.shape[0])
+        obs = self.encoder.encode(_obs)
+        seq_length = batch['action'].shape[1]
+
+
+        if not self.obs_as_global_cond:
+            obs = einops.repeat(obs,'b z -> b t z',t=seq_length)
+        else: 
+            obs = einops.repeat(obs,'b z -> b t z',t=1)
+
         # obs = self.encoder.encode(_obs)
 
         _action = batch['action']
         action = einops.rearrange(_action, "b t ... -> (b t) ...")
         action = self.encoder.encode(action)
         action = einops.rearrange(action, "(b t) ... -> b t ...", b=_action.shape[0])
+
+        
 
         # handle different ways of passing observation
         local_cond = None
@@ -295,15 +369,20 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-        self.z_diff = 1.0
-        self.image_diff = 1.
+      
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = self.z_diff * loss.mean()
+        loss =  loss.mean()
 
 
         # compute the loss in image space.
+
+
+
+
+
+       
 
         if pred_type == 'epsilon':
             # traj_start = 
@@ -311,19 +390,36 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
             # modify here!!    
             # TODO: This expects the t to be the same for all the elements in the batch :(
             # TODO: Fix this!
-            traj_start = self.noise_scheduler.step(
-                pred, timesteps, noisy_trajectory).pred_original_sample
+
+            # note: by using this we see that it is equivalent!!
+            # timesteps[:] = 20
+            # self.noise_scheduler.config.thresholding = False
+            # self.noise_scheduler.config.clip_sample = False
+            # traj_start2 = self.noise_scheduler.step(
+            #     pred, timesteps[0] , noisy_trajectory).pred_original_sample
+            
+          
+
+            traj_start = self.predict_start_from_noise(noisy_trajectory, timesteps, pred)
+          
+            
+
+
+
             assert traj_start is not None
         elif pred_type ==    'sample':
-            traj_start = trajectory
+            traj_start = pred
 
         # lets decode traj start
         traj_start = einops.rearrange(traj_start, "b t c -> (b t) c")
-        img_start = self.decoder.decode(traj_start)
+        if not self.obs_as_global_cond and not self.obs_as_local_cond:
+            img_start = self.decoder.decode(traj_start[:,:self.action_dim])
+        else:
+            img_start = self.decoder.decode(traj_start)
         traj_img_fake = einops.rearrange(img_start, "(b t) c h w -> b t c h w", b=bsz)
         img_loss = F.mse_loss(traj_img_fake, batch['action'], reduction='mean')
-        loss += self.image_diff * img_loss
-        
 
+        # loss += self.image_diff * img_loss
 
-        return loss
+        return { 'z_loss' : loss , 'img_loss': img_loss}
+
