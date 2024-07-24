@@ -282,7 +282,8 @@ class DiffusionUnetLowdimPolicyEncoder(BaseLowdimPolicy):
         batch = {"obs" : y , "action": x}
         return self.compute_loss(batch)
         
-        
+    def sample(self,y):
+        return self.predict_action({"obs": y})["action_pred"]
 
     def compute_loss(self, batch):
         # normalize input
